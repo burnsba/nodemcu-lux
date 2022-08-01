@@ -1,0 +1,17 @@
+https://learn.adafruit.com/adafruit-aht20/overview
+
+https://learn.adafruit.com/adafruit-veml7700/arduino
+
+https://www.youtube.com/watch?v=NGCUfZhxY9U&t=1250s
+
+https://randomnerdtutorials.com/esp8266-pinout-reference-gpios/
+
+https://www.emqx.com/en/blog/esp8266-connects-to-the-public-mqtt-broker
+
+https://www.fusehunt.co.uk/post/wemos-d1-mini-home-assistant-mqtt-auto-discovery/
+
+https://community.home-assistant.io/t/manually-add-mqtt-entities/264695/7
+
+https://roelofjanelsinga.com/articles/mqtt-discovery-with-an-arduino/
+
+https://www.home-assistant.io/docs/mqtt/discovery/
