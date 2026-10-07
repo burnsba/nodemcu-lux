@@ -1,9 +1,21 @@
 #include <Wire.h>
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
+#include <Ticker.h>
 
 #include "Adafruit_VEML7700.h"
 #include <Adafruit_AHTX0.h>
+
+/***
+The physical board consists of: esp8266 node mcu board, connected to aht20 temperature sensor, and veml7700 light sensor.
+optional: PIR motion sensor.
+
+The physical board has two status LEDs: power, wifi connected.
+
+The board is always connected to power over usb.
+
+Sensor readings are taken periodically then published to Home Assistant mqtt over wifi.
+*/
 
 /*
   secrets.h: local configuration.
@@ -21,7 +33,8 @@
 
 #define HOME_ASSISTANT_ENABLE 1
 
-// whether motion sensor is available
+// whether motion sensor is available.
+// I have two different physical boards, one has a motion sensor, the other doesn't.
 #define HAS_PIR 1
 
 /////////////////////////////////////////////////////////////////
@@ -36,6 +49,10 @@
 #define AHTX0_SDA_PIN 12
 #define AHTX0_SCL_PIN 14
 
+#define AHT20_I2C_ADDR 0x38
+// max time to wait for the AHT20 to finish a measurement (datasheet: ~80ms).
+#define AHT20_READ_TIMEOUT_MS 500
+
 #define VEML7700_I2C_CLOCK 10000
 
 #define VEML7700_SDA_PIN 5
@@ -47,7 +64,14 @@
 // number of milliseconds between publish events
 #define PUBLISH_MS 30000
 
+// software watchdog: reset the board if loop() hasn't completed in this many seconds.
+// The hardware watchdog doesn't catch hangs that call delay() or yield().
+#define SOFT_WATCHDOG_S 180
+
 volatile int _isr_motion_flag = 0;
+
+Ticker soft_watchdog_ticker;
+volatile unsigned int soft_watchdog_seconds = 0;
 
 Adafruit_AHTX0 aht;
 Adafruit_VEML7700 veml = Adafruit_VEML7700();
@@ -144,6 +168,68 @@ void aht_take_wire() {
   delay(100);
 }
 
+// Read the AHT20 directly instead of aht.getEvent(). The Adafruit library spins
+// forever if an i2c read fails (failed status read returns 0xFF, which has the busy bit set).
+// Conversion matches Adafruit_AHTX0::getEvent.
+// Returns false on i2c error or timeout.
+bool aht20_read(float *humidity, float *temperature) {
+  uint8_t data[6];
+  unsigned long start_time;
+  uint32_t raw;
+  int i;
+
+  // trigger measurement
+  Wire.beginTransmission(AHT20_I2C_ADDR);
+  Wire.write(0xAC);
+  Wire.write(0x33);
+  Wire.write(0x00);
+  if (Wire.endTransmission() != 0) {
+    Serial.printf("aht20: trigger failed\n");
+    return false;
+  }
+
+  start_time = millis();
+  while (1) {
+    delay(20);
+
+    if (Wire.requestFrom(AHT20_I2C_ADDR, 6) == 6) {
+      for (i = 0; i < 6; i++) {
+        data[i] = Wire.read();
+      }
+
+      // status byte, bit 7 = busy
+      if (!(data[0] & 0x80)) {
+        break;
+      }
+    }
+
+    if (millis() - start_time > AHT20_READ_TIMEOUT_MS) {
+      Serial.printf("aht20: read timeout\n");
+      return false;
+    }
+  }
+
+  raw = ((uint32_t)data[1] << 12) | ((uint32_t)data[2] << 4) | (data[3] >> 4);
+  *humidity = ((float)raw * 100) / 0x100000;
+
+  raw = (((uint32_t)data[3] & 0x0F) << 16) | ((uint32_t)data[4] << 8) | data[5];
+  *temperature = ((float)raw * 200 / 0x100000) - 50;
+
+  return true;
+}
+
+// Runs once a second from a timer. ESP.reset() is safe to call from timer context.
+void soft_watchdog_tick() {
+  soft_watchdog_seconds++;
+  if (soft_watchdog_seconds > SOFT_WATCHDOG_S) {
+    ESP.reset();
+  }
+}
+
+void soft_watchdog_feed() {
+  soft_watchdog_seconds = 0;
+}
+
 void connect_to_wifi() {
   int wifi_pin_toggle = 0;
 
@@ -215,7 +301,8 @@ void publish_discover_motion(String append_device_name, String uid, String value
     Serial.print(json_publish.c_str());
     Serial.print("\n\n");
   
-    pub_response = client.publish(publish_topic.c_str(), json_publish.c_str());
+    // retained, so Home Assistant gets the config again after HA or broker restart.
+    pub_response = client.publish(publish_topic.c_str(), json_publish.c_str(), true);
     Serial.printf("pub_response: %d\n", pub_response);
 
     if (pub_response == 0) {
@@ -254,7 +341,8 @@ void publish_discover_sensor(String append_device_name, String device_class, Str
     Serial.print(json_publish.c_str());
     Serial.print("\n\n");
   
-    pub_response = client.publish(publish_topic.c_str(), json_publish.c_str());
+    // retained, so Home Assistant gets the config again after HA or broker restart.
+    pub_response = client.publish(publish_topic.c_str(), json_publish.c_str(), true);
     Serial.printf("pub_response: %d\n", pub_response);
 
     if (pub_response == 0) {
@@ -272,6 +360,10 @@ void setup() {
   delay(50);
 
   Serial.print("\n\nboot\n");
+  Serial.printf("reset reason: %s\n", ESP.getResetReason().c_str());
+
+  // armed before sensor/wifi/mqtt setup, so a hang during setup also resets.
+  soft_watchdog_ticker.attach(1, soft_watchdog_tick);
 
 #if ENABLE_BLINK
   pinMode(LED_BUILTIN, OUTPUT);
@@ -310,6 +402,8 @@ void setup() {
   publish_discover_sensor(String("Ambient Light"), String("illuminance"), String(""), sensor_topic_als_uid, String("value_json.lux_als"), sensor_topic_als_config);
   publish_discover_sensor(String("White Light"), String("illuminance"), String(""), sensor_topic_white_uid, String("value_json.lux_white"), sensor_topic_white_config);
   publish_discover_sensor(String("Lux"), String("illuminance"), String(""), sensor_topic_lux_uid, String("value_json.lux"), sensor_topic_lux_config);
+
+  soft_watchdog_feed();
 }
 
 #if HAS_PIR
@@ -326,12 +420,16 @@ void loop() {
   int raw_als;
   int raw_white;
   float lux;
-  sensors_event_t humidity, temp;
+  float humidity;
+  float temperature;
   String json_publish;
   int need_to_publish;
   unsigned long loop_start_time;
 
   loop_start_time = millis();
+
+  // service mqtt keepalive; otherwise the broker drops the connection between publishes.
+  client.loop();
 
 #if ENABLE_BLINK
   if (last_led_time == 0 || millis() - last_led_time > 1000) {
@@ -342,9 +440,14 @@ void loop() {
 #endif
   
   aht_take_wire();
-  aht.getEvent(&humidity, &temp);// populate temp and humidity objects with fresh data
-  temperature_f = (temp.temperature * 1.8) + 32;
-  Serial.printf("humidity: %f, temperature c: %f, temperature f: %f\n", humidity.relative_humidity, temp.temperature, temperature_f);
+  if (!aht20_read(&humidity, &temperature)) {
+    // Skip this round. Watchdog is not fed, so if the sensor stays
+    // unreadable the board resets after SOFT_WATCHDOG_S.
+    delay(1000);
+    return;
+  }
+  temperature_f = (temperature * 1.8) + 32;
+  Serial.printf("humidity: %f, temperature c: %f, temperature f: %f\n", humidity, temperature, temperature_f);
 
   delay(200);
 
@@ -398,6 +501,7 @@ void loop() {
 
   if (!need_to_publish) {
     Serial.printf("need_to_publish: false\n");
+    soft_watchdog_feed();
     delay(500);
     return;
   }
@@ -413,8 +517,8 @@ void loop() {
   }
 
 #if HAS_PIR
-  json_publish = "{ \"humidity\":" + String(humidity.relative_humidity, 2) + ", " +
-    "\"temperature\":" + String(temp.temperature, 2) + ", " +
+  json_publish = "{ \"humidity\":" + String(humidity, 2) + ", " +
+    "\"temperature\":" + String(temperature, 2) + ", " +
     "\"temperature_f\":" + String(temperature_f, 2) + ", " +
     "\"lux_als\":" + raw_als + ", " +
     "\"lux_white\":" + raw_white + ", " +
@@ -422,8 +526,8 @@ void loop() {
     "\"occupancy_isr\":" + (_isr_motion_flag ? "true" : "false") + ", " +
     "\"occupancy\":" + (motion_pin_value ? "true" : "false") + "}";
 #else
-  json_publish = "{ \"humidity\":" + String(humidity.relative_humidity, 2) + ", " +
-    "\"temperature\":" + String(temp.temperature, 2) + ", " +
+  json_publish = "{ \"humidity\":" + String(humidity, 2) + ", " +
+    "\"temperature\":" + String(temperature, 2) + ", " +
     "\"temperature_f\":" + String(temperature_f, 2) + ", " +
     "\"lux_als\":" + raw_als + ", " +
     "\"lux_white\":" + raw_white + ", " +
@@ -432,10 +536,13 @@ void loop() {
 
 #if HOME_ASSISTANT_ENABLE
   Serial.printf("publish topic: %s\n", sensor_topic_state.c_str());
-  client.publish(sensor_topic_state.c_str(), json_publish.c_str());
+  if (!client.publish(sensor_topic_state.c_str(), json_publish.c_str())) {
+    Serial.printf("publish failed, mqtt state: %d\n", client.state());
+  }
 #endif
 
   last_publish_time = millis();
+  soft_watchdog_feed();
 
   delay(500);
 }
